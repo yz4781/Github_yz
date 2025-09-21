@@ -113,6 +113,7 @@ void MX_FREERTOS_Init(void) {
 	 BaseType_t ret;
   LCD_Init();
   LCD_Clear();
+// RotaryEncoder_Init();
 //  NRF24L01_Init();
 //    HAL_ADC_Start_IT(&hadc1);
 	
@@ -157,10 +158,10 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
 // 
-//    extern void Music_task();
-// 
+    extern void Music_task();
+ 
 
-// xTaskCreate(Music_task, "MusicTask", 128, NULL, osPriorityNormal, NULL);
+ xTaskCreate(Music_task, "MusicTask", 128, NULL, osPriorityNormal, NULL);
     extern void PlayMusic(void *params);
    xTaskCreate(PlayMusic, "MusicTask", 128, NULL, osPriorityNormal, &xSoundTaskHandle);
   	xTaskCreate(game1_task, "GameTask", 128, NULL, osPriorityNormal, NULL);	
@@ -199,10 +200,12 @@ void StartDefaultTask(void *argument)
 
 	
     IRReceiver_Init();
-	LCD_PrintString(0, 0, "Waiting control");
-	
+////	LCD_PrintString(0, 0, "Waiting control");
+//    extern void PlayMusic(void *params);
+//   xTaskCreate(PlayMusic, "MusicTask", 128, NULL, osPriorityNormal, &xSoundTaskHandle);
 	while (1)
 	{
+//		RotaryEncoder_Test();
 // 	    // ��ʾADCֵ�ͶԱȶ�
 //    OLED_PrintString(0, 2, "ADC: ");
 //     uint16_t adc_val =  HAL_ADC_GetValue(&hadc1);
@@ -212,7 +215,8 @@ void StartDefaultTask(void *argument)
 //    OLED_PrintString(0, 4, "Contrast: ");
 //    OLED_PrintSignedVal(9, 4, contrast);
 //		//    // �Զ���������
-     OLED_AutoAdjustBrightness();
+		
+      OLED_AutoAdjustBrightness();
 	}
 
  
@@ -224,4 +228,5 @@ void StartDefaultTask(void *argument)
 /* USER CODE BEGIN Application */
 
 /* USER CODE END Application */
+
 
