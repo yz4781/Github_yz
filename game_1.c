@@ -1,4 +1,4 @@
- 
+  
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
@@ -19,7 +19,8 @@
 #include "driver_rotary_encoder.h"
 #include "driver_mpu6050.h"
  #include "NRF24L01.h" 
-
+#define KEY_GPIO_GROUP GPIOA
+#define KEY_GPIO_PIN   GPIO_PIN_3
 #define NOINVERT	false
 #define INVERT		true
 
@@ -74,8 +75,7 @@ typedef struct {
 // 全局变量（双玩家+全局胜负）
 GameState player1;  // 玩家1（OLED上半屏）
 GameState player2;  // 玩家2（OLED下半屏）
-int win_count1 = 0; // 玩家1胜局数
-int win_count2 = 0; // 玩家2胜局数
+ 
 int current_round = 1; // 当前局数（1~5）
  
   
@@ -93,7 +93,9 @@ static   xQueueHandle g_xQueueKey2;
  
 #define DATA_TYPE_DEVICE 0x00  // 设备数据标识
 #define DATA_TYPE_KEY 0x01     // Key值标识
-
+// 此处选择最后1页（页地址0x0800FC00，大小1KB），避开程序区
+#define FLASH_SCORE_ADDR    0x0800FC00  // 比分存储的Flash起始地址
+ 
 typedef struct{
 	float x;
 	float y;
@@ -139,25 +141,117 @@ static QueueHandle_t g_xQueueRotary;
 static QueueHandle_t g_xQueueMPU6050; /* MPU6050队列 */
 static   TaskHandle_t xSoundTaskHandle = NULL;
 BaseType_t ret;
+typedef struct {
+    uint16_t win_count1;  // 玩家1胜局数
+    uint16_t win_count2;  // 玩家2胜局数
+    uint16_t check_sum;
+} FlashScoreTypeDef;
+
+static  FlashScoreTypeDef   set_score={0,0,0};
+ 
 int32_t    addr,writeFiashData;
-// 初始化单个玩家的游戏状态
-void writeFiashTest(void )
+int32_t da;
+
+//void writeFiashTest(void )
+//{
+//	HAL_FLASH_Unlock ();
+//	FLASH_EraseInitTypeDef f;
+//	 f .TypeErase=FLASH_TYPEERASE_PAGES ;
+//	f.PageAddress=addr;
+//	f.NbPages=1;
+//	uint32_t PageErrror=0;
+//	
+//	HAL_FLASHEx_Erase (&f,&PageErrror);
+//	
+//	HAL_FLASH_Program (FLASH_TYPEPROGRAM_WORD ,addr,writeFiashData);
+//	
+//	HAL_FLASH_Lock ();
+
+//}
+int KEY;
+ int Key_Read(void)
 {
-	HAL_FLASH_Unlock ();
-	FLASH_EraseInitTypeDef f;
-	 f .TypeErase=FLASH_TYPEERASE_PAGES ;
-	f.PageAddress=addr;
-	f.NbPages=1;
-	uint32_t PageErrror=0;
-	
-	HAL_FLASHEx_Erase (&f,&PageErrror);
-	
-	HAL_FLASH_Program (FLASH_TYPEPROGRAM_WORD ,addr,writeFiashData);
-	
-	HAL_FLASH_Lock ();
-
+    if (GPIO_PIN_RESET == HAL_GPIO_ReadPin(KEY_GPIO_GROUP, KEY_GPIO_PIN))
+	{vTaskDelay (10);
+		 if (GPIO_PIN_RESET == HAL_GPIO_ReadPin(KEY_GPIO_GROUP, KEY_GPIO_PIN))
+        return 1;
+	}
+    else
+        return 0;    
 }
-
+static HAL_StatusTypeDef Flash_ErasePage(uint32_t addr) {
+    HAL_FLASH_Unlock();  // 解锁Flash（写入/擦除前必须解锁）
+    
+    FLASH_EraseInitTypeDef erase_init;
+    erase_init.TypeErase = FLASH_TYPEERASE_PAGES;  // 按页擦除
+    erase_init.PageAddress = addr;                 // 要擦除的页地址
+    erase_init.NbPages = 1;                        // 擦除1页
+    
+    uint32_t page_error = 0;
+    HAL_StatusTypeDef status = HAL_FLASHEx_Erase(&erase_init, &page_error);
+    
+    HAL_FLASH_Lock();  // 锁定Flash（操作完成后锁定，防止误写）
+    return status;
+}
+HAL_StatusTypeDef Flash_WriteScore(FlashScoreTypeDef score) {
+    score.check_sum = score.win_count1 + score.win_count2;
+    
+    // 1. 擦除目标页
+    HAL_StatusTypeDef status = Flash_ErasePage(FLASH_SCORE_ADDR);
+    if (status != HAL_OK) return status;
+    
+    // 2. 按半字（16位）写入（需地址2字节对齐）
+    HAL_FLASH_Unlock();
+    uint16_t* p_data = (uint16_t*)&score;  // 按16位指针访问数据
+    uint32_t data_size = sizeof(FlashScoreTypeDef) / 2;  // 计算半字数量
+    
+    for (uint32_t i = 0; i < data_size; i++) {
+        // 地址需2字节对齐（FLASH_SCORE_ADDR + 2*i）
+        status = HAL_FLASH_Program(
+            FLASH_TYPEPROGRAM_HALFWORD,  // 改用半字编程
+            FLASH_SCORE_ADDR + 2*i, 
+            p_data[i]  // 直接写入16位数据
+        );
+        if (status != HAL_OK) {
+            HAL_FLASH_Lock();
+            return status;
+        }
+    }
+    
+    // 3. 若结构体大小为奇数，处理最后1个字节（补0对齐）
+    if (sizeof(FlashScoreTypeDef) % 2 != 0) {
+        uint8_t* p_last_byte = (uint8_t*)&score + sizeof(FlashScoreTypeDef) - 1;
+        status = HAL_FLASH_Program(
+            FLASH_TYPEPROGRAM_HALFWORD,
+            FLASH_SCORE_ADDR + sizeof(FlashScoreTypeDef) - 1,
+            *p_last_byte  // 高8位会自动补0，不影响数据
+        );
+    }
+    
+    HAL_FLASH_Lock();
+    return HAL_OK;
+}
+HAL_StatusTypeDef Flash_ReadScore(FlashScoreTypeDef* score) {
+    // 1. 从Flash地址读取数据到结构体
+    memcpy(score, (void*)FLASH_SCORE_ADDR, sizeof(FlashScoreTypeDef));
+    
+    // 2. 校验数据完整性（对比校验和）
+    uint16_t calc_sum = score->win_count1 + score->win_count2;
+    if (score->check_sum != calc_sum) {
+        // 校验失败（可能是首次上电、Flash数据损坏），初始化比分
+        score->win_count1 = 0;
+        score->win_count2 = 0;
+        score->check_sum = 0;
+        return HAL_ERROR;
+    }
+    
+    return HAL_OK;
+}
+HAL_StatusTypeDef Flash_ResetScore(void) {
+    FlashScoreTypeDef reset_score = {0, 0, 0};
+    return Flash_WriteScore(reset_score);
+}
+// 初始化单个玩家的游戏状态
 void game_init_single(GameState *player, int x_pos, int init_obstacle_speed) {
  
     player->car.x =x_pos ; // 汽车宽5像素， 
@@ -251,7 +345,7 @@ void move_obstacles_single(GameState *player) {
 
 // 全局障碍物处理（双局并行）
 void update_obstacles(void) {
-    if (win_count1 >= 3 || win_count2 >= 3) return;
+    if (set_score.win_count1 >= 3 || set_score.win_count2 >= 3) return;
     
     move_obstacles_single(&player1);
     move_obstacles_single(&player2);
@@ -281,7 +375,7 @@ void draw_round_result(  char *result, int x, int y) ;
 
 // 全局碰撞检测与局胜负判断
 void check_game_round_end(void) {
-    if (win_count1 >= 3 || win_count2 >= 3)	return;
+    if (set_score.win_count1 >= 3 || set_score.win_count2 >= 3)	return;
     
     bool p1_collide = check_collision_single(&player1);
     bool p2_collide = check_collision_single(&player2);
@@ -311,7 +405,8 @@ void check_game_round_end(void) {
 		g_game_running =2;
         // 玩家1碰撞：玩家2胜
         player1.game_over = true;
-        win_count2++;
+        set_score.win_count2++;
+		Flash_WriteScore(set_score); // 写入最新比分
         draw_round_result("PLAYER 2 WIN!", 50, 30);
 		 
     } 
@@ -319,7 +414,9 @@ void check_game_round_end(void) {
 		g_game_running =2;
         // 玩家2碰撞：玩家1胜
         player2.game_over = true;
-        win_count1++;
+		 
+        set_score.win_count1++;
+		Flash_WriteScore(set_score); // 写入最新比分
         draw_round_result("PLAYER 1 WIN!", 50, 30);
 		  
     }
@@ -340,7 +437,7 @@ void draw_round_result(  char *result, int x, int y) {
     current_round++;
     
     // 判断是否分胜负（五局三胜）
-    if (win_count1 >= 3 || win_count2 >= 3) {
+    if (set_score.win_count1 >= 3 || set_score.win_count2 >= 3) {
 		g_game_running =0;
         draw_final_result(); // 显示最终胜负
     } else {
@@ -354,21 +451,22 @@ void draw_round_result(  char *result, int x, int y) {
 // 显示最终五局三胜结果
 void draw_final_result(void) {
     LCD_Clear();
-    if (win_count1 >= 3) {
+    if (set_score.win_count1 >= 3) {
         draw_string_P(PSTR(" WINNER: PLAYER 1!"), false, 1, 10);
-    } else if (win_count2 >= 3){
+    } else if (set_score.win_count2 >= 3){
         draw_string_P(PSTR(" WINNER: PLAYER 2!"), false, 1, 20);
     }
     draw_string_P(PSTR("SCORE: "), false, 20, 40);
     char score_buf[20];
-    sprintf(score_buf, "P1:%d P2:%d", win_count1, win_count2);
+    sprintf(score_buf, "P1:%d P2:%d", set_score.win_count1, set_score.win_count2);
     draw_string(score_buf, false, 60, 40);
      TickType_t debounce_time = 0;
      TickType_t last_debounce_time = 0;
     debounce_time = xTaskGetTickCount();
-    
-    // 游戏结束，无限循环
-    while (1) {
+   
+ 
+    while (!KEY) {
+		
 		   NRF24L01_DataSrc data_src;  
   
 	  data_src = NRF24L01_Receive(); 
@@ -382,6 +480,12 @@ void draw_final_result(void) {
 				OLED_ManualSetBrightness(100);
 				}
 	         }
+			KEY =Key_Read ();
+			 if (KEY )
+			 { set_score .win_count1=0;
+			     set_score .win_count2=0;
+				 LCD_Clear ();
+			 }
     }
 } 
 
@@ -448,7 +552,7 @@ void process_input_player2(struct  input_data idata) {
 
 // 全局输入处理（从队列读取按键）
 void process_game_input(void) {
-    if (win_count1 >= 3 || win_count2 >= 3) return; // 已分胜负则不响应
+    if (set_score.win_count1 >= 3 || set_score.win_count2 >= 3) return; // 已分胜负则不响应
     
    struct  input_data idata1,idata2;
     if (xQueueReceive( g_xQueuePlatform1, &idata1, 0) == pdPASS)
@@ -613,7 +717,7 @@ void draw_game_single(GameState *player,   char *label, int x_offset) {
 
 // 全局游戏绘制（双界面并行）
 void car_game_draw(void) {
-    if (win_count1 >= 3 || win_count2 >= 3) return; // 已分胜负则不绘制
+    if (set_score .win_count1 >= 3 ||set_score . win_count2 >= 3) return; // 已分胜负则不绘制
     
     // 绘制玩家1（左半屏，标签Y=5）
     draw_game_single(&player1, "P1", 1);
@@ -642,8 +746,9 @@ void Music_task()
 //			 
 //			  }
 			         
- 
-				  if(g_game_running==2)
+ while(1)
+	 
+ {	  if(g_game_running==2)
 				  {
 					   vTaskSuspend(xSoundTaskHandle);
 					   PassiveBuzzer_Control(0); /* 停止蜂鸣器 */
@@ -669,73 +774,59 @@ void Music_task()
  
 		 
  
-
+			  }
 
 }
-
-
+void   Play_game(void*params) 
+{ while(1){
+	
+	
+	KEY =Key_Read();
+		if(KEY){set_score .win_count1=0;
+	    set_score .win_count2=0;
+	}
+	InputTask();
+		car_game_task();
+	LCD_PrintSignedVal(1,2, set_score .win_count1);
+	LCD_PrintSignedVal(15,1, set_score .win_count2);
+}
+}
 void game1_task()
-{		 
+{	
+
+	
     NRF24L01_Init();
 	g_framebuffer = LCD_GetFrameBuffer(&g_xres, &g_yres, &g_bpp);
 	draw_init();
 	draw_end();
+ 
+    FlashScoreTypeDef flash_score;
+    HAL_StatusTypeDef flash_status = Flash_ReadScore(&flash_score);
+    if (flash_status == HAL_OK) {
+        // 读取成功，更新全局胜局数
+       set_score . win_count1 = flash_score.win_count1;
+         set_score .win_count2 = flash_score.win_count2;
+    } else {
+        // 读取失败（首次上电/数据损坏），初始化比分并写入Flash
+        set_score . win_count1 = 0;
+         set_score .win_count2 = 0;
+        Flash_ResetScore(); // 写入初始比分（0-0）
+    }
+ 
+ 
   	car_game_init();
    g_xQueuePlatform1 = xQueueCreate(10, sizeof(struct input_data));
    g_xQueuePlatform2 = xQueueCreate(10, sizeof(struct input_data));
-    
-//	    draw_bitmap(player1.car.x, player1 .car.y, car_img, 5, 8, NOINVERT, 0);
-//	draw_flushArea(player1.car.x, player1.car.y, 5, 8); 
-//    xTaskCreate(InputTask, "InputTask", 128, NULL, osPriorityNormal, NULL);
-    
-
-
- 
-
-//    xTaskCreate(Music_task, "Music_task", 128, NULL, osPriorityNormal, NULL);
-
+    xTaskCreate(Play_game, "Playgame", 128, NULL, osPriorityNormal,NULL);
     while (1)
     {
- 
-//		 static    uint8_t rx_data[2] = {1,7}; // 临时存储接收数据
-//      NRF24L01_DataSrc data_src; // 数据来源标识（哪个通道/发送端）
-//	  struct input_data idata1;
-//	  KeyEvent menu_key1;
-//	  struct input_data idata2;
-//	  KeyEvent menu_key2;
-//	  
-//	  
-//	  data_src = NRF24L01_Receive();  
-//	  LCD_PrintSignedVal(3, 3, data_src); 
-// 
-//        if ( data_src==NRF24L01_DATA_FROM_CH0)
-//		{   
-// 		 NRF24L01_GetRxData(0, rx_data);
-// 		//	memcpy(rx_data, NRF24L01_RxData_Ch0, NRF24L01_RX_PACKET_WIDTH);  
-//			
-// 		LCD_PrintSignedVal(2, 0, rx_data[0]); 
-//			
-//			
-//		}
-//		    if ( data_src==NRF24L01_DATA_FROM_CH1)
-//		{   
-// 		 NRF24L01_GetRxData(1, rx_data);
-// 		//	memcpy(rx_data, NRF24L01_RxData_Ch0, NRF24L01_RX_PACKET_WIDTH);  
-//			
-// 		LCD_PrintSignedVal(2, 3, rx_data[1]); 
-//			
-//			
-//		}
-//		else LCD_Clear ();
- //		Music_task();
- 	InputTask();
-  	 	car_game_task();
- 
+
          vTaskDelay(50);
     }
 }
 
  
+
 // void car_game_draw(void) 
 //{
 //    if (game_over)
@@ -789,7 +880,6 @@ void game1_task()
 //			sprintf(score_str, "%d", score);
 //			draw_string(score_str, false, 10, 10);
 //}
-
 
 
 
